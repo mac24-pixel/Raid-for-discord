@@ -9,7 +9,7 @@ import os
 # ─────────────────────────────────────────
 #  CONFIGURACIÓN
 # ─────────────────────────────────────────
-TOKEN = "TU_TOKEN_AQUI"   # ← pega tu nuevo token aquí
+TOKEN = "MTUwNDAwODEwMDk0NzAzNDE1Mg.GuMgQs.aq6Qzx5euA3Rb8oO2dTfuXx6ASc3rJPKQSUcYY"   # ← pega tu nuevo token aquí
 
 PREFIX = "!"
 
