@@ -31,6 +31,27 @@ join_times  = []                        # lista de timestamps de joins recientes
 msg_tracker = defaultdict(list)         # user_id → [timestamps]
 link_tracker= defaultdict(list)
 
+# ── Estado avanzado ───────────────────────
+# Configuración por servidor (guild_id → dict)
+guild_config: dict[int, dict] = defaultdict(lambda: {
+    "autorole_id":    None,   # ID del rol asignado a nuevos miembros
+    "verify_role_id": None,   # ID del rol de verificación requerido
+    "raid_alert_role_id": None,  # ID del rol que se menciona en alertas de raid
+    "antibot":        False,  # Expulsar bots automáticamente
+    "slowmode":       0,      # Segundos de slowmode activo en todos los canales
+})
+
+# Whitelist de usuarios que omiten las comprobaciones anti-raid (guild_id → set of user_ids)
+whitelist: dict[int, set] = defaultdict(set)
+
+# Estadísticas de raid (guild_id → dict)
+raid_stats: dict[int, dict] = defaultdict(lambda: {
+    "joins":  [],   # timestamps de joins en la última hora
+    "kicks":  [],   # timestamps de kicks en la última hora
+    "mutes":  [],   # timestamps de mutes en la última hora
+    "stat_reset_at": datetime.utcnow(),
+})
+
 # ─────────────────────────────────────────
 #  BOT
 # ─────────────────────────────────────────
@@ -64,6 +85,26 @@ def make_embed(title: str, description: str, color: discord.Color) -> discord.Em
     e.set_footer(text="Anti-Raid Bot")
     return e
 
+def _prune_stats(guild_id: int):
+    """Elimina entradas de estadísticas con más de 1 hora de antigüedad."""
+    cutoff = datetime.utcnow() - timedelta(hours=1)
+    s = raid_stats[guild_id]
+    s["joins"] = [t for t in s["joins"] if t > cutoff]
+    s["kicks"] = [t for t in s["kicks"] if t > cutoff]
+    s["mutes"] = [t for t in s["mutes"] if t > cutoff]
+
+def _record_join(guild_id: int):
+    raid_stats[guild_id]["joins"].append(datetime.utcnow())
+    _prune_stats(guild_id)
+
+def _record_kick(guild_id: int):
+    raid_stats[guild_id]["kicks"].append(datetime.utcnow())
+    _prune_stats(guild_id)
+
+def _record_mute(guild_id: int):
+    raid_stats[guild_id]["mutes"].append(datetime.utcnow())
+    _prune_stats(guild_id)
+
 # ─────────────────────────────────────────
 #  EVENTOS
 # ─────────────────────────────────────────
@@ -80,8 +121,28 @@ async def on_ready():
 async def on_member_join(member: discord.Member):
     global raid_mode
     now = datetime.utcnow()
+    guild_id = member.guild.id
+    cfg = guild_config[guild_id]
 
-    # Registrar join
+    # ── Antibot: expulsar bots automáticamente ──
+    if member.bot and cfg["antibot"]:
+        try:
+            await member.kick(reason="Antibot: bot detectado automáticamente")
+        except discord.Forbidden:
+            pass
+        e = make_embed(
+            "🤖 Bot expulsado (antibot)",
+            f"{member.mention} (`{member.name}`) fue expulsado automáticamente por ser un bot.",
+            discord.Color.red()
+        )
+        await log(member.guild, e)
+        _record_kick(guild_id)
+        return
+
+    # Registrar join en estadísticas
+    _record_join(guild_id)
+
+    # Registrar join para detección de raid
     join_times.append(now)
 
     # Limpiar joins fuera de la ventana
@@ -91,33 +152,47 @@ async def on_member_join(member: discord.Member):
     # ¿Activar raid mode?
     if len(join_times) >= JOIN_THRESHOLD and not raid_mode:
         raid_mode = True
+        alert_mention = ""
+        alert_role_id = cfg.get("raid_alert_role_id")
+        if alert_role_id:
+            alert_role = member.guild.get_role(alert_role_id)
+            if alert_role:
+                alert_mention = f"{alert_role.mention} "
         e = make_embed(
             "🚨 RAID DETECTADO — Modo raid ACTIVADO",
-            f"{len(join_times)} usuarios se unieron en {JOIN_WINDOW}s.\n"
+            f"{alert_mention}{len(join_times)} usuarios se unieron en {JOIN_WINDOW}s.\n"
             "Nuevas cuentas serán expulsadas automáticamente.",
             discord.Color.red()
         )
-        await log(member.guild, e)
-
-    # En raid mode: expulsar cuentas nuevas
-    if raid_mode:
-        age_days = (datetime.utcnow() - member.created_at.replace(tzinfo=None)).days
-        if age_days < ACCOUNT_MIN_AGE:
-            try:
-                await member.send(
-                    f"Has sido expulsado de **{member.guild.name}** porque el servidor "
-                    "está bajo un ataque raid. Intenta unirte más tarde."
-                )
-            except discord.Forbidden:
-                pass
-            await member.kick(reason="Raid mode: cuenta demasiado nueva")
-            e = make_embed(
-                "👢 Kick automático (raid mode)",
-                f"{member.mention} (`{member.name}`) — cuenta de {age_days} días.",
-                discord.Color.orange()
-            )
+        log_ch = get_log_channel(member.guild)
+        if log_ch:
+            await log_ch.send(content=alert_mention if alert_mention else None, embed=e)
+        else:
             await log(member.guild, e)
-            return
+
+    # En raid mode: expulsar cuentas nuevas (whitelist omite el check)
+    if raid_mode:
+        if member.id in whitelist[guild_id]:
+            pass  # usuario en whitelist, no expulsar
+        else:
+            age_days = (datetime.utcnow() - member.created_at.replace(tzinfo=None)).days
+            if age_days < ACCOUNT_MIN_AGE:
+                try:
+                    await member.send(
+                        f"Has sido expulsado de **{member.guild.name}** porque el servidor "
+                        "está bajo un ataque raid. Intenta unirte más tarde."
+                    )
+                except discord.Forbidden:
+                    pass
+                await member.kick(reason="Raid mode: cuenta demasiado nueva")
+                _record_kick(guild_id)
+                e = make_embed(
+                    "👢 Kick automático (raid mode)",
+                    f"{member.mention} (`{member.name}`) — cuenta de {age_days} días.",
+                    discord.Color.orange()
+                )
+                await log(member.guild, e)
+                return
 
     # Fuera de raid mode: verificar antigüedad mínima
     age_days = (datetime.utcnow() - member.created_at.replace(tzinfo=None)).days
@@ -129,6 +204,16 @@ async def on_member_join(member: discord.Member):
         )
         await log(member.guild, e)
 
+    # ── Autorole: asignar rol automáticamente ──
+    autorole_id = cfg.get("autorole_id")
+    if autorole_id:
+        autorole = member.guild.get_role(autorole_id)
+        if autorole:
+            try:
+                await member.add_roles(autorole, reason="Autorole: asignación automática")
+            except discord.Forbidden:
+                pass
+
 # ── Anti-spam de mensajes ─────────────────
 
 @bot.event
@@ -138,8 +223,14 @@ async def on_message(message: discord.Message):
         return
 
     user_id = message.author.id
+    guild_id = message.guild.id
     now = datetime.utcnow()
     cutoff = now - timedelta(seconds=MESSAGE_WINDOW)
+
+    # Usuarios en whitelist omiten todas las comprobaciones de spam
+    if user_id in whitelist[guild_id]:
+        await bot.process_commands(message)
+        return
 
     # ── Spam de mensajes ──
     msg_tracker[user_id] = [t for t in msg_tracker[user_id] if t > cutoff]
@@ -148,6 +239,7 @@ async def on_message(message: discord.Message):
     if len(msg_tracker[user_id]) >= MESSAGE_LIMIT:
         await message.delete()
         await mute_member(message.author, "Anti-spam: demasiados mensajes")
+        _record_mute(guild_id)
         e = make_embed(
             "🔇 Mute por spam",
             f"{message.author.mention} silenciado {MUTE_DURATION}s por spam de mensajes.",
@@ -162,6 +254,7 @@ async def on_message(message: discord.Message):
     if mention_count >= MENTION_LIMIT:
         await message.delete()
         await mute_member(message.author, "Anti-spam: mass mention")
+        _record_mute(guild_id)
         e = make_embed(
             "🔇 Mute por mass mention",
             f"{message.author.mention} mencionó {mention_count} usuarios/roles.",
@@ -180,6 +273,7 @@ async def on_message(message: discord.Message):
         if len(link_tracker[user_id]) >= LINK_SPAM_LIMIT:
             await message.delete()
             await mute_member(message.author, "Anti-spam: link spam")
+            _record_mute(guild_id)
             e = make_embed(
                 "🔇 Mute por spam de links",
                 f"{message.author.mention} envió demasiados links.",
@@ -373,20 +467,360 @@ async def ayuda(ctx):
     e = discord.Embed(title="🛡️ Comandos Anti-Raid", color=discord.Color.blurple(),
                       timestamp=discord.utils.utcnow())
     cmds = [
-        ("!raidmode [on/off]",  "Activa/desactiva modo raid"),
-        ("!lockdown",           "Bloquea escritura en todos los canales"),
-        ("!unlock",             "Restaura permisos de escritura"),
-        ("!masskick [días]",    "Expulsa cuentas nuevas (def: 7 días)"),
-        ("!massmute [días]",    "Silencia cuentas nuevas (def: 7 días)"),
-        ("!purge [n]",          "Borra últimos N mensajes (máx 100)"),
-        ("!ban @user [razón]",  "Banea un usuario"),
-        ("!unban [ID]",         "Desbanea por ID"),
-        ("!estado",             "Muestra estado del bot"),
+        ("!raidmode [on/off]",          "Activa/desactiva modo raid"),
+        ("!lockdown",                   "Bloquea escritura en todos los canales"),
+        ("!unlock",                     "Restaura permisos de escritura"),
+        ("!masskick [días]",            "Expulsa cuentas nuevas (def: 7 días)"),
+        ("!massmute [días]",            "Silencia cuentas nuevas (def: 7 días)"),
+        ("!purge [n]",                  "Borra últimos N mensajes (máx 100)"),
+        ("!ban @user [razón]",          "Banea un usuario"),
+        ("!unban [ID]",                 "Desbanea por ID"),
+        ("!estado",                     "Muestra estado del bot"),
+        ("!autorole [role_id]",         "Asigna rol automáticamente a nuevos miembros"),
+        ("!antibot",                    "Activa/desactiva expulsión automática de bots"),
+        ("!whitelist add/remove @user", "Añade o elimina usuario de la whitelist"),
+        ("!raid-stats",                 "Muestra estadísticas de raid de la última hora"),
+        ("!slowmode [segundos]",        "Aplica slowmode a todos los canales (0 = desactivar)"),
+        ("!nuke-spam",                  "Elimina mensajes recientes de bots/spam"),
+        ("!verify-role [role_id]",      "Establece rol de verificación requerido"),
+        ("!raid-alert [@rol]",          "Configura rol a mencionar en alertas de raid"),
+        ("!config",                     "Muestra la configuración anti-raid actual"),
+        ("!reset-stats",                "Reinicia las estadísticas de raid"),
     ]
     for nombre, desc in cmds:
         e.add_field(name=f"`{nombre}`", value=desc, inline=False)
     e.set_footer(text="Anti-Raid Bot • Solo admins pueden usar comandos de moderación")
     await ctx.send(embed=e)
+
+
+# ─────────────────────────────────────────
+#  NUEVOS COMANDOS AVANZADOS
+# ─────────────────────────────────────────
+
+@bot.command(name="autorole")
+@commands.has_permissions(administrator=True)
+async def autorole(ctx, role_id: int = None):
+    """!autorole [role_id] — asigna un rol automáticamente a nuevos miembros."""
+    cfg = guild_config[ctx.guild.id]
+    if role_id is None:
+        # Desactivar autorole
+        cfg["autorole_id"] = None
+        e = make_embed(
+            "🎭 Autorole desactivado",
+            "Ya no se asignará ningún rol automáticamente a los nuevos miembros.",
+            discord.Color.orange()
+        )
+        await ctx.send(embed=e)
+        await log(ctx.guild, e)
+        return
+
+    role = ctx.guild.get_role(role_id)
+    if role is None:
+        await ctx.send(
+            embed=make_embed("❌ Error", f"No se encontró ningún rol con ID `{role_id}`.",
+                             discord.Color.red())
+        )
+        return
+
+    cfg["autorole_id"] = role_id
+    e = make_embed(
+        "🎭 Autorole configurado",
+        f"El rol {role.mention} será asignado automáticamente a todos los nuevos miembros.\n"
+        f"Útil para cuarentena o verificación.",
+        discord.Color.green()
+    )
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+
+
+@bot.command(name="antibot")
+@commands.has_permissions(administrator=True)
+async def antibot(ctx):
+    """!antibot — activa o desactiva la expulsión automática de bots."""
+    cfg = guild_config[ctx.guild.id]
+    cfg["antibot"] = not cfg["antibot"]
+    estado = cfg["antibot"]
+    color = discord.Color.red() if estado else discord.Color.green()
+    estado_str = "🤖 ACTIVADO" if estado else "✅ DESACTIVADO"
+    e = make_embed(
+        f"Antibot {estado_str}",
+        f"La expulsión automática de bots ha sido **{'activada' if estado else 'desactivada'}** "
+        f"por {ctx.author.mention}.",
+        color
+    )
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+
+
+@bot.command(name="whitelist")
+@commands.has_permissions(administrator=True)
+async def whitelist_cmd(ctx, accion: str, member: discord.Member = None):
+    """!whitelist add/remove @usuario — gestiona la whitelist anti-raid."""
+    if accion.lower() not in ("add", "remove", "añadir", "eliminar", "list", "lista"):
+        await ctx.send(
+            embed=make_embed("❌ Uso incorrecto",
+                             "Uso: `!whitelist add @usuario` | `!whitelist remove @usuario` | `!whitelist list`",
+                             discord.Color.red())
+        )
+        return
+
+    guild_id = ctx.guild.id
+
+    # Mostrar lista
+    if accion.lower() in ("list", "lista"):
+        wl = whitelist[guild_id]
+        if not wl:
+            desc = "La whitelist está vacía."
+        else:
+            lines = []
+            for uid in wl:
+                user = ctx.guild.get_member(uid)
+                lines.append(f"• {user.mention if user else f'ID: {uid}'}")
+            desc = "\n".join(lines)
+        e = make_embed("📋 Whitelist actual", desc, discord.Color.blurple())
+        await ctx.send(embed=e)
+        return
+
+    if member is None:
+        await ctx.send(
+            embed=make_embed("❌ Error", "Debes mencionar a un usuario.", discord.Color.red())
+        )
+        return
+
+    if accion.lower() in ("add", "añadir"):
+        whitelist[guild_id].add(member.id)
+        e = make_embed(
+            "✅ Whitelist actualizada",
+            f"{member.mention} ha sido añadido a la whitelist y omitirá las comprobaciones anti-raid.",
+            discord.Color.green()
+        )
+    else:
+        whitelist[guild_id].discard(member.id)
+        e = make_embed(
+            "🗑️ Whitelist actualizada",
+            f"{member.mention} ha sido eliminado de la whitelist.",
+            discord.Color.orange()
+        )
+
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+
+
+@bot.command(name="raid-stats")
+@commands.has_permissions(administrator=True)
+async def raid_stats_cmd(ctx):
+    """!raid-stats — muestra estadísticas de raid de la última hora."""
+    guild_id = ctx.guild.id
+    _prune_stats(guild_id)
+    s = raid_stats[guild_id]
+    reset_at = s["stat_reset_at"]
+    reset_str = reset_at.strftime("%d/%m/%Y %H:%M UTC")
+
+    color = discord.Color.red() if raid_mode else discord.Color.blurple()
+    e = discord.Embed(
+        title="📊 Estadísticas de Raid (última hora)",
+        color=color,
+        timestamp=discord.utils.utcnow()
+    )
+    e.add_field(name="🚪 Joins",  value=str(len(s["joins"])),  inline=True)
+    e.add_field(name="👢 Kicks",  value=str(len(s["kicks"])),  inline=True)
+    e.add_field(name="🔇 Mutes",  value=str(len(s["mutes"])),  inline=True)
+    e.add_field(name="🚨 Modo raid", value="ACTIVO" if raid_mode else "Inactivo", inline=True)
+    e.add_field(name="🔄 Stats desde", value=reset_str, inline=True)
+    e.set_footer(text="Anti-Raid Bot")
+    await ctx.send(embed=e)
+
+
+@bot.command(name="slowmode")
+@commands.has_permissions(administrator=True)
+async def slowmode(ctx, segundos: int = 0):
+    """!slowmode [segundos] — aplica slowmode a todos los canales (0 para desactivar)."""
+    if segundos < 0 or segundos > 21600:
+        await ctx.send(
+            embed=make_embed("❌ Error",
+                             "El slowmode debe estar entre **0** y **21600** segundos (6 horas).",
+                             discord.Color.red())
+        )
+        return
+
+    guild_config[ctx.guild.id]["slowmode"] = segundos
+    aplicados = 0
+    for channel in ctx.guild.text_channels:
+        try:
+            await channel.edit(slowmode_delay=segundos,
+                               reason=f"Slowmode {'activado' if segundos else 'desactivado'} por {ctx.author}")
+            aplicados += 1
+        except discord.Forbidden:
+            pass
+
+    if segundos == 0:
+        desc = f"Slowmode **desactivado** en {aplicados} canales por {ctx.author.mention}."
+        color = discord.Color.green()
+        title = "⏩ Slowmode desactivado"
+    else:
+        desc = f"Slowmode de **{segundos}s** aplicado en {aplicados} canales por {ctx.author.mention}."
+        color = discord.Color.orange()
+        title = "🐢 Slowmode activado"
+
+    e = make_embed(title, desc, color)
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+
+
+@bot.command(name="nuke-spam")
+@commands.has_permissions(administrator=True)
+async def nuke_spam(ctx, limite: int = 100):
+    """!nuke-spam [límite] — elimina mensajes recientes de bots y usuarios marcados como spam."""
+    limite = min(max(limite, 1), 500)
+
+    def es_spam(msg: discord.Message) -> bool:
+        # Considera spam: mensajes de bots, mensajes con muchos links, o mensajes con mass mentions
+        if msg.author.bot:
+            return True
+        link_count = sum(1 for w in msg.content.split()
+                         if w.startswith(("http://", "https://", "discord.gg/")))
+        if link_count >= LINK_SPAM_LIMIT:
+            return True
+        if len(msg.mentions) + len(msg.role_mentions) >= MENTION_LIMIT:
+            return True
+        return False
+
+    try:
+        borrados = await ctx.channel.purge(limit=limite, check=es_spam)
+        e = make_embed(
+            "💥 Nuke-spam completado",
+            f"Se eliminaron **{len(borrados)}** mensajes de spam/bots en {ctx.channel.mention}.\n"
+            f"Ejecutado por {ctx.author.mention}.",
+            discord.Color.orange()
+        )
+    except discord.Forbidden:
+        e = make_embed("❌ Error", "No tengo permisos para eliminar mensajes en este canal.",
+                       discord.Color.red())
+
+    msg = await ctx.send(embed=e)
+    await log(ctx.guild, e)
+    await asyncio.sleep(8)
+    try:
+        await msg.delete()
+    except discord.NotFound:
+        pass
+
+
+@bot.command(name="verify-role")
+@commands.has_permissions(administrator=True)
+async def verify_role(ctx, role_id: int = None):
+    """!verify-role [role_id] — establece el rol de verificación requerido."""
+    cfg = guild_config[ctx.guild.id]
+    if role_id is None:
+        cfg["verify_role_id"] = None
+        e = make_embed(
+            "🔓 Rol de verificación eliminado",
+            "Ya no se requiere un rol de verificación.",
+            discord.Color.orange()
+        )
+        await ctx.send(embed=e)
+        await log(ctx.guild, e)
+        return
+
+    role = ctx.guild.get_role(role_id)
+    if role is None:
+        await ctx.send(
+            embed=make_embed("❌ Error", f"No se encontró ningún rol con ID `{role_id}`.",
+                             discord.Color.red())
+        )
+        return
+
+    cfg["verify_role_id"] = role_id
+    e = make_embed(
+        "🔐 Rol de verificación configurado",
+        f"El rol {role.mention} es ahora el rol de verificación requerido.\n"
+        f"Los miembros sin este rol serán considerados no verificados.",
+        discord.Color.green()
+    )
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+
+
+@bot.command(name="raid-alert")
+@commands.has_permissions(administrator=True)
+async def raid_alert(ctx, role: discord.Role = None):
+    """!raid-alert [@rol] — configura el rol que se menciona cuando se detecta un raid."""
+    cfg = guild_config[ctx.guild.id]
+    if role is None:
+        cfg["raid_alert_role_id"] = None
+        e = make_embed(
+            "🔕 Alerta de raid desactivada",
+            "No se mencionará ningún rol cuando se detecte un raid.",
+            discord.Color.orange()
+        )
+        await ctx.send(embed=e)
+        await log(ctx.guild, e)
+        return
+
+    cfg["raid_alert_role_id"] = role.id
+    e = make_embed(
+        "🔔 Alerta de raid configurada",
+        f"{role.mention} será mencionado automáticamente cuando se detecte un raid.",
+        discord.Color.green()
+    )
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+
+
+@bot.command(name="config")
+@commands.has_permissions(administrator=True)
+async def config_cmd(ctx):
+    """!config — muestra la configuración anti-raid actual del servidor."""
+    cfg = guild_config[ctx.guild.id]
+    guild_id = ctx.guild.id
+
+    # Resolver nombres de roles
+    def role_name(role_id):
+        if role_id is None:
+            return "No configurado"
+        r = ctx.guild.get_role(role_id)
+        return r.mention if r else f"ID: {role_id} (no encontrado)"
+
+    wl_count = len(whitelist[guild_id])
+
+    e = discord.Embed(
+        title="⚙️ Configuración Anti-Raid",
+        color=discord.Color.blurple(),
+        timestamp=discord.utils.utcnow()
+    )
+    e.add_field(name="🚨 Modo raid",          value="ACTIVO" if raid_mode else "Inactivo",    inline=True)
+    e.add_field(name="🤖 Antibot",            value="✅ Activo" if cfg["antibot"] else "❌ Inactivo", inline=True)
+    e.add_field(name="🐢 Slowmode global",    value=f"{cfg['slowmode']}s" if cfg["slowmode"] else "Desactivado", inline=True)
+    e.add_field(name="🎭 Autorole",           value=role_name(cfg["autorole_id"]),            inline=True)
+    e.add_field(name="🔐 Rol verificación",   value=role_name(cfg["verify_role_id"]),         inline=True)
+    e.add_field(name="🔔 Rol alerta raid",    value=role_name(cfg["raid_alert_role_id"]),     inline=True)
+    e.add_field(name="📋 Whitelist",          value=f"{wl_count} usuario(s)",                 inline=True)
+    e.add_field(name="⏱️ Umbral raid",        value=f"{JOIN_THRESHOLD} joins en {JOIN_WINDOW}s", inline=True)
+    e.add_field(name="📅 Edad mínima cuenta", value=f"{ACCOUNT_MIN_AGE} días",                inline=True)
+    e.add_field(name="🔇 Duración mute",      value=f"{MUTE_DURATION}s",                      inline=True)
+    e.add_field(name="💬 Límite spam",        value=f"{MESSAGE_LIMIT} msg/{MESSAGE_WINDOW}s", inline=True)
+    e.add_field(name="🔗 Límite links",       value=f"{LINK_SPAM_LIMIT} links/{MESSAGE_WINDOW}s", inline=True)
+    e.set_footer(text="Anti-Raid Bot")
+    await ctx.send(embed=e)
+
+
+@bot.command(name="reset-stats")
+@commands.has_permissions(administrator=True)
+async def reset_stats(ctx):
+    """!reset-stats — reinicia las estadísticas de raid del servidor."""
+    guild_id = ctx.guild.id
+    s = raid_stats[guild_id]
+    s["joins"].clear()
+    s["kicks"].clear()
+    s["mutes"].clear()
+    s["stat_reset_at"] = datetime.utcnow()
+    e = make_embed(
+        "🔄 Estadísticas reiniciadas",
+        f"Todas las estadísticas de raid han sido reiniciadas por {ctx.author.mention}.",
+        discord.Color.green()
+    )
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
 
 
 # ─────────────────────────────────────────
