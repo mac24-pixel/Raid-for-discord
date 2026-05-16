@@ -39,6 +39,7 @@ guild_config: dict[int, dict] = defaultdict(lambda: {
     "raid_alert_role_id": None,  # ID del rol que se menciona en alertas de raid
     "antibot":        False,  # Expulsar bots automáticamente
     "slowmode":       0,      # Segundos de slowmode activo en todos los canales
+    "spam_filter":    True,   # Filtro de spam activo
 })
 
 # Whitelist de usuarios que omiten las comprobaciones anti-raid (guild_id → set of user_ids)
@@ -51,6 +52,12 @@ raid_stats: dict[int, dict] = defaultdict(lambda: {
     "mutes":  [],   # timestamps de mutes en la última hora
     "stat_reset_at": datetime.utcnow(),
 })
+
+# Sistema de advertencias (guild_id → user_id → count)
+warnings: dict[int, dict] = defaultdict(lambda: defaultdict(int))
+
+# Registro de acciones (guild_id → list of dicts)
+action_logs: dict[int, list] = defaultdict(list)
 
 # ─────────────────────────────────────────
 #  BOT
@@ -105,6 +112,15 @@ def _record_mute(guild_id: int):
     raid_stats[guild_id]["mutes"].append(datetime.utcnow())
     _prune_stats(guild_id)
 
+def _log_action(guild_id: int, action_type: str, user_id: int, reason: str = ""):
+    """Registra una acción en el log de acciones."""
+    action_logs[guild_id].append({
+        "timestamp": datetime.utcnow(),
+        "type": action_type,
+        "user_id": user_id,
+        "reason": reason
+    })
+
 # ─────────────────────────────────────────
 #  EVENTOS
 # ─────────────────────────────────────────
@@ -137,6 +153,7 @@ async def on_member_join(member: discord.Member):
         )
         await log(member.guild, e)
         _record_kick(guild_id)
+        _log_action(guild_id, "kick", member.id, "Bot expulsado automáticamente")
         return
 
     # Registrar join en estadísticas
@@ -186,6 +203,7 @@ async def on_member_join(member: discord.Member):
                     pass
                 await member.kick(reason="Raid mode: cuenta demasiado nueva")
                 _record_kick(guild_id)
+                _log_action(guild_id, "kick", member.id, "Raid mode: cuenta nueva")
                 e = make_embed(
                     "👢 Kick automático (raid mode)",
                     f"{member.mention} (`{member.name}`) — cuenta de {age_days} días.",
@@ -226,9 +244,15 @@ async def on_message(message: discord.Message):
     guild_id = message.guild.id
     now = datetime.utcnow()
     cutoff = now - timedelta(seconds=MESSAGE_WINDOW)
+    cfg = guild_config[guild_id]
 
     # Usuarios en whitelist omiten todas las comprobaciones de spam
     if user_id in whitelist[guild_id]:
+        await bot.process_commands(message)
+        return
+
+    # Si el filtro de spam está desactivado, solo procesar comandos
+    if not cfg["spam_filter"]:
         await bot.process_commands(message)
         return
 
@@ -240,6 +264,7 @@ async def on_message(message: discord.Message):
         await message.delete()
         await mute_member(message.author, "Anti-spam: demasiados mensajes")
         _record_mute(guild_id)
+        _log_action(guild_id, "mute", user_id, "Anti-spam: demasiados mensajes")
         e = make_embed(
             "🔇 Mute por spam",
             f"{message.author.mention} silenciado {MUTE_DURATION}s por spam de mensajes.",
@@ -255,6 +280,7 @@ async def on_message(message: discord.Message):
         await message.delete()
         await mute_member(message.author, "Anti-spam: mass mention")
         _record_mute(guild_id)
+        _log_action(guild_id, "mute", user_id, "Mass mention")
         e = make_embed(
             "🔇 Mute por mass mention",
             f"{message.author.mention} mencionó {mention_count} usuarios/roles.",
@@ -274,6 +300,7 @@ async def on_message(message: discord.Message):
             await message.delete()
             await mute_member(message.author, "Anti-spam: link spam")
             _record_mute(guild_id)
+            _log_action(guild_id, "mute", user_id, "Link spam")
             e = make_embed(
                 "🔇 Mute por spam de links",
                 f"{message.author.mention} envió demasiados links.",
@@ -309,6 +336,7 @@ async def toggle_raid_mode(ctx, estado: str = None):
     e = make_embed(f"Modo raid {estado_str}", f"Cambiado por {ctx.author.mention}.", color)
     await ctx.send(embed=e)
     await log(ctx.guild, e)
+    _log_action(ctx.guild.id, "raidmode_toggle", ctx.author.id, f"Modo raid: {raid_mode}")
 
 
 @bot.command(name="lockdown")
@@ -372,6 +400,7 @@ async def masskick(ctx, min_days: int = 7):
             try:
                 await member.kick(reason=f"masskick: cuenta de {age} días")
                 expulsados += 1
+                _log_action(ctx.guild.id, "kick", member.id, f"Masskick: cuenta de {age} días")
             except discord.Forbidden:
                 pass
     e = make_embed(
@@ -397,6 +426,7 @@ async def massmute(ctx, min_days: int = 7):
             try:
                 await member.timeout(until, reason=f"massmute: cuenta de {age} días")
                 silenciados += 1
+                _log_action(ctx.guild.id, "mute", member.id, f"Massmute: cuenta de {age} días")
             except discord.Forbidden:
                 pass
     e = make_embed(
@@ -429,6 +459,7 @@ async def purge(ctx, cantidad: int = 10):
 async def ban(ctx, member: discord.Member, *, razon: str = "Sin razón especificada"):
     """!ban @usuario [razón] — banea a un usuario."""
     await member.ban(reason=f"{razon} | por {ctx.author}")
+    _log_action(ctx.guild.id, "ban", member.id, razon)
     e = make_embed("🔨 Ban", f"{member.mention} baneado.\nRazón: {razon}", discord.Color.red())
     await ctx.send(embed=e)
     await log(ctx.guild, e)
@@ -440,7 +471,146 @@ async def unban(ctx, user_id: int):
     """!unban [ID] — desbanea a un usuario por su ID."""
     user = await bot.fetch_user(user_id)
     await ctx.guild.unban(user, reason=f"Unban por {ctx.author}")
+    _log_action(ctx.guild.id, "unban", user_id, "Unban")
     e = make_embed("✅ Unban", f"{user} (`{user_id}`) desbaneado.", discord.Color.green())
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+
+
+@bot.command(name="kick")
+@commands.has_permissions(kick_members=True)
+async def kick(ctx, member: discord.Member, *, razon: str = "Sin razón especificada"):
+    """!kick @usuario [razón] — expulsa a un usuario."""
+    await member.kick(reason=f"{razon} | por {ctx.author}")
+    _record_kick(ctx.guild.id)
+    _log_action(ctx.guild.id, "kick", member.id, razon)
+    e = make_embed("👢 Kick", f"{member.mention} expulsado.\nRazón: {razon}", discord.Color.orange())
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+
+
+@bot.command(name="mute")
+@commands.has_permissions(moderate_members=True)
+async def mute(ctx, member: discord.Member, minutos: int = 5, *, razon: str = "Sin razón"):
+    """!mute @usuario [minutos] [razón] — silencia a un usuario."""
+    minutos = min(max(minutos, 1), 40320)  # Máx 28 días (40320 minutos)
+    until = discord.utils.utcnow() + timedelta(minutes=minutos)
+    
+    try:
+        await member.timeout(until, reason=f"{razon} | por {ctx.author}")
+        _record_mute(ctx.guild.id)
+        _log_action(ctx.guild.id, "mute", member.id, razon)
+        e = make_embed(
+            "🔇 Mute",
+            f"{member.mention} silenciado por **{minutos} minutos**.\nRazón: {razon}",
+            discord.Color.orange()
+        )
+        await ctx.send(embed=e)
+        await log(ctx.guild, e)
+    except discord.Forbidden:
+        await ctx.send("❌ No puedo silenciar a este usuario.", delete_after=5)
+
+
+@bot.command(name="unmute")
+@commands.has_permissions(moderate_members=True)
+async def unmute(ctx, member: discord.Member):
+    """!unmute @usuario — dessilencia a un usuario."""
+    try:
+        await member.timeout(None, reason=f"Unmute por {ctx.author}")
+        e = make_embed("🔊 Unmute", f"{member.mention} dessilenciado.", discord.Color.green())
+        await ctx.send(embed=e)
+        await log(ctx.guild, e)
+        _log_action(ctx.guild.id, "unmute", member.id, "Unmute")
+    except discord.Forbidden:
+        await ctx.send("❌ No puedo dessilenciar a este usuario.", delete_after=5)
+
+
+@bot.command(name="unmuteall")
+@commands.has_permissions(administrator=True)
+async def unmuteall(ctx):
+    """!unmuteall — dessilencia a TODOS los usuarios silenciados."""
+    dessilenciados = 0
+    for member in ctx.guild.members:
+        if member.timed_out:
+            try:
+                await member.timeout(None, reason=f"Unmuteall por {ctx.author}")
+                dessilenciados += 1
+                _log_action(ctx.guild.id, "unmute", member.id, "Unmuteall")
+            except discord.Forbidden:
+                pass
+    
+    e = make_embed(
+        "🔊 Unmuteall completado",
+        f"**{dessilenciados}** usuarios dessilenciados por {ctx.author.mention}.",
+        discord.Color.green()
+    )
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+
+
+@bot.command(name="warn")
+@commands.has_permissions(moderate_members=True)
+async def warn(ctx, member: discord.Member, *, razon: str = "Sin razón"):
+    """!warn @usuario [razón] — advierte a un usuario (acumula 3 = expulsión)."""
+    guild_id = ctx.guild.id
+    warnings[guild_id][member.id] += 1
+    warn_count = warnings[guild_id][member.id]
+    
+    _log_action(guild_id, "warn", member.id, razon)
+    
+    e = make_embed(
+        "⚠️ Advertencia",
+        f"{member.mention} ha recibido una advertencia.\n"
+        f"Razón: {razon}\n\n"
+        f"**Advertencias: {warn_count}/3**",
+        discord.Color.yellow()
+    )
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+    
+    # Si llega a 3 advertencias, expulsar
+    if warn_count >= 3:
+        try:
+            await member.kick(reason=f"Expulsado tras 3 advertencias. Última: {razon}")
+            _record_kick(guild_id)
+            _log_action(guild_id, "kick", member.id, "Expulsión automática por 3 advertencias")
+            
+            e = make_embed(
+                "👢 Expulsión automática",
+                f"{member.mention} expulsado por acumular 3 advertencias.",
+                discord.Color.red()
+            )
+            await log(ctx.guild, e)
+        except discord.Forbidden:
+            pass
+
+
+@bot.command(name="clearwarnings")
+@commands.has_permissions(administrator=True)
+async def clearwarnings(ctx, member: discord.Member = None):
+    """!clearwarnings [@usuario] — elimina advertencias (todas si no se especifica usuario)."""
+    guild_id = ctx.guild.id
+    
+    if member is None:
+        # Limpiar todas las advertencias
+        warnings[guild_id].clear()
+        e = make_embed(
+            "🧹 Advertencias eliminadas",
+            "Todas las advertencias del servidor han sido eliminadas.",
+            discord.Color.green()
+        )
+        _log_action(guild_id, "clearwarnings_all", ctx.author.id, "Limpiar todas")
+    else:
+        # Limpiar advertencias de un usuario
+        old_warns = warnings[guild_id][member.id]
+        warnings[guild_id][member.id] = 0
+        e = make_embed(
+            "🧹 Advertencias eliminadas",
+            f"{member.mention} tiene ahora 0 advertencias (tenía {old_warns}).",
+            discord.Color.green()
+        )
+        _log_action(guild_id, "clearwarnings", member.id, f"Limpiar de {old_warns} a 0")
+    
     await ctx.send(embed=e)
     await log(ctx.guild, e)
 
@@ -461,34 +631,175 @@ async def estado(ctx):
     await ctx.send(embed=e)
 
 
+@bot.command(name="get-logs")
+@commands.has_permissions(administrator=True)
+async def get_logs(ctx, limite: int = 20):
+    """!get-logs [límite] — muestra las últimas acciones registradas."""
+    guild_id = ctx.guild.id
+    logs = action_logs[guild_id][-limite:]
+    
+    if not logs:
+        await ctx.send("📋 No hay registros disponibles.", delete_after=5)
+        return
+    
+    e = discord.Embed(
+        title="📋 Registro de Acciones",
+        color=discord.Color.blurple(),
+        timestamp=discord.utils.utcnow()
+    )
+    
+    description = ""
+    for log_entry in reversed(logs):
+        timestamp = log_entry["timestamp"].strftime("%H:%M:%S")
+        action = log_entry["type"]
+        user_id = log_entry["user_id"]
+        reason = log_entry["reason"]
+        
+        description += f"**[{timestamp}]** `{action}` | <@{user_id}> | {reason}\n"
+    
+    e.description = description if description else "Sin acciones"
+    e.set_footer(text=f"Mostrando últimas {len(logs)} acciones")
+    await ctx.send(embed=e)
+
+
+@bot.command(name="spam-filter")
+@commands.has_permissions(administrator=True)
+async def spam_filter(ctx, estado: str = None):
+    """!spam-filter [on/off] — activa o desactiva el filtro de spam."""
+    cfg = guild_config[ctx.guild.id]
+    
+    if estado is None:
+        cfg["spam_filter"] = not cfg["spam_filter"]
+    elif estado.lower() in ("on", "activar", "1"):
+        cfg["spam_filter"] = True
+    elif estado.lower() in ("off", "desactivar", "0"):
+        cfg["spam_filter"] = False
+    else:
+        await ctx.send("Uso: `!spam-filter on` o `!spam-filter off`")
+        return
+    
+    estado_actual = cfg["spam_filter"]
+    color = discord.Color.green() if estado_actual else discord.Color.red()
+    estado_str = "✅ ACTIVADO" if estado_actual else "❌ DESACTIVADO"
+    
+    e = make_embed(
+        f"Filtro de spam {estado_str}",
+        f"El filtro de spam ha sido {'activado' if estado_actual else 'desactivado'} por {ctx.author.mention}.",
+        color
+    )
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+    _log_action(ctx.guild.id, "spam_filter", ctx.author.id, f"Filtro: {estado_actual}")
+
+
+@bot.command(name="reglas")
+async def reglas(ctx):
+    """!reglas — muestra las reglas del servidor."""
+    e = discord.Embed(
+        title="📜 Reglas del Servidor",
+        color=discord.Color.blurple(),
+        timestamp=discord.utils.utcnow()
+    )
+    
+    reglas = [
+        ("1️⃣ Respeto", "Trata a todos con respeto. No se toleran insultos, burlas o discriminación."),
+        ("2️⃣ No spam", "No envíes mensajes repetitivos, links innecesarios o contenido spam."),
+        ("3️⃣ Contenido apropiado", "No se permite contenido sexual, violento, ilegal o perturbador."),
+        ("4️⃣ Sin raid", "No intentes hacer raid, invitar botnets o ataques al servidor."),
+        ("5️⃣ Sin publicidad", "No hagas publicidad de otros servidores o productos sin permiso."),
+        ("6️⃣ Sin spoilers", "Usa spoilers al compartir contenido que puede arruinar películas/series."),
+        ("7️⃣ Idioma", "Mantén un idioma apropiado. Sin palabras ofensivas excesivas."),
+        ("8️⃣ No harassment", "No acosar, abusar o amenazar a otros miembros."),
+        ("9️⃣ Privacidad", "No compartas datos personales de otros sin consentimiento."),
+        ("🔟 Obedece a mods", "Respeta a los moderadores y sigue sus instrucciones."),
+    ]
+    
+    for titulo, descripcion in reglas:
+        e.add_field(name=titulo, value=descripcion, inline=False)
+    
+    e.add_field(
+        name="⚠️ Violaciones de reglas",
+        value="**Primero:** Advertencia\n**Segundo:** Mute\n**Tercero:** Expulsión\n**Grave:** Ban inmediato",
+        inline=False
+    )
+    
+    e.set_footer(text="Cumple las reglas para mantener un servidor seguro y amigable 💪")
+    await ctx.send(embed=e)
+
+
 @bot.command(name="ayuda")
 async def ayuda(ctx):
     """!ayuda — muestra todos los comandos."""
     e = discord.Embed(title="🛡️ Comandos Anti-Raid", color=discord.Color.blurple(),
                       timestamp=discord.utils.utcnow())
-    cmds = [
+    
+    # Comandos de moderación
+    mod_cmds = [
         ("!raidmode [on/off]",          "Activa/desactiva modo raid"),
+        ("!kick @user [razón]",         "Expulsa a un usuario"),
+        ("!ban @user [razón]",          "Banea a un usuario"),
+        ("!unban [ID]",                 "Desbanea por ID"),
+        ("!mute @user [min] [razón]",  "Silencia a un usuario (minutos)"),
+        ("!unmute @user",               "Dessilencia a un usuario"),
+        ("!unmuteall",                  "Dessilencia a TODOS"),
+        ("!warn @user [razón]",         "Advierte a un usuario (3 = expulsión)"),
+        ("!clearwarnings [@user]",      "Limpia advertencias"),
+    ]
+    
+    # Comandos de bloqueo
+    lock_cmds = [
         ("!lockdown",                   "Bloquea escritura en todos los canales"),
         ("!unlock",                     "Restaura permisos de escritura"),
         ("!masskick [días]",            "Expulsa cuentas nuevas (def: 7 días)"),
         ("!massmute [días]",            "Silencia cuentas nuevas (def: 7 días)"),
+    ]
+    
+    # Comandos de limpieza
+    clean_cmds = [
         ("!purge [n]",                  "Borra últimos N mensajes (máx 100)"),
-        ("!ban @user [razón]",          "Banea un usuario"),
-        ("!unban [ID]",                 "Desbanea por ID"),
-        ("!estado",                     "Muestra estado del bot"),
+        ("!nuke-spam",                  "Elimina mensajes recientes de bots/spam"),
+    ]
+    
+    # Comandos de configuración
+    config_cmds = [
+        ("!spam-filter [on/off]",       "Activa/desactiva filtro de spam"),
         ("!autorole [role_id]",         "Asigna rol automáticamente a nuevos miembros"),
         ("!antibot",                    "Activa/desactiva expulsión automática de bots"),
         ("!whitelist add/remove @user", "Añade o elimina usuario de la whitelist"),
-        ("!raid-stats",                 "Muestra estadísticas de raid de la última hora"),
-        ("!slowmode [segundos]",        "Aplica slowmode a todos los canales (0 = desactivar)"),
-        ("!nuke-spam",                  "Elimina mensajes recientes de bots/spam"),
+        ("!slowmode [segundos]",        "Aplica slowmode a todos los canales"),
         ("!verify-role [role_id]",      "Establece rol de verificación requerido"),
         ("!raid-alert [@rol]",          "Configura rol a mencionar en alertas de raid"),
-        ("!config",                     "Muestra la configuración anti-raid actual"),
+    ]
+    
+    # Comandos informativos
+    info_cmds = [
+        ("!estado",                     "Muestra estado del bot"),
+        ("!raid-stats",                 "Muestra estadísticas de raid"),
+        ("!config",                     "Muestra configuración anti-raid"),
+        ("!get-logs [limite]",          "Ver últimas acciones registradas"),
+        ("!reglas",                     "Muestra las reglas del servidor"),
         ("!reset-stats",                "Reinicia las estadísticas de raid"),
     ]
-    for nombre, desc in cmds:
+    
+    for nombre, desc in mod_cmds:
         e.add_field(name=f"`{nombre}`", value=desc, inline=False)
+    
+    e.add_field(name="🔒 Bloqueo", value="━━━━━━━━━━━━━━━━━━", inline=False)
+    for nombre, desc in lock_cmds:
+        e.add_field(name=f"`{nombre}`", value=desc, inline=False)
+    
+    e.add_field(name="🧹 Limpieza", value="━━━━━━━━━━━━━━━━━━", inline=False)
+    for nombre, desc in clean_cmds:
+        e.add_field(name=f"`{nombre}`", value=desc, inline=False)
+    
+    e.add_field(name="⚙️ Configuración", value="━━━━━━━━━━━━━━━━━━", inline=False)
+    for nombre, desc in config_cmds:
+        e.add_field(name=f"`{nombre}`", value=desc, inline=False)
+    
+    e.add_field(name="📊 Información", value="━━━━━━━━━━━━━━━━━━", inline=False)
+    for nombre, desc in info_cmds:
+        e.add_field(name=f"`{nombre}`", value=desc, inline=False)
+    
     e.set_footer(text="Anti-Raid Bot • Solo admins pueden usar comandos de moderación")
     await ctx.send(embed=e)
 
@@ -512,6 +823,7 @@ async def autorole(ctx, role_id: int = None):
         )
         await ctx.send(embed=e)
         await log(ctx.guild, e)
+        _log_action(ctx.guild.id, "autorole", ctx.author.id, "Desactivar")
         return
 
     role = ctx.guild.get_role(role_id)
@@ -531,6 +843,7 @@ async def autorole(ctx, role_id: int = None):
     )
     await ctx.send(embed=e)
     await log(ctx.guild, e)
+    _log_action(ctx.guild.id, "autorole", ctx.author.id, f"Configurar: {role.name}")
 
 
 @bot.command(name="antibot")
@@ -550,6 +863,7 @@ async def antibot(ctx):
     )
     await ctx.send(embed=e)
     await log(ctx.guild, e)
+    _log_action(ctx.guild.id, "antibot", ctx.author.id, f"Estado: {estado}")
 
 
 @bot.command(name="whitelist")
@@ -594,6 +908,7 @@ async def whitelist_cmd(ctx, accion: str, member: discord.Member = None):
             f"{member.mention} ha sido añadido a la whitelist y omitirá las comprobaciones anti-raid.",
             discord.Color.green()
         )
+        _log_action(guild_id, "whitelist_add", member.id, "Añadir a whitelist")
     else:
         whitelist[guild_id].discard(member.id)
         e = make_embed(
@@ -601,6 +916,7 @@ async def whitelist_cmd(ctx, accion: str, member: discord.Member = None):
             f"{member.mention} ha sido eliminado de la whitelist.",
             discord.Color.orange()
         )
+        _log_action(guild_id, "whitelist_remove", member.id, "Eliminar de whitelist")
 
     await ctx.send(embed=e)
     await log(ctx.guild, e)
@@ -665,6 +981,7 @@ async def slowmode(ctx, segundos: int = 0):
     e = make_embed(title, desc, color)
     await ctx.send(embed=e)
     await log(ctx.guild, e)
+    _log_action(ctx.guild.id, "slowmode", ctx.author.id, f"Slowmode: {segundos}s")
 
 
 @bot.command(name="nuke-spam")
@@ -693,6 +1010,7 @@ async def nuke_spam(ctx, limite: int = 100):
             f"Ejecutado por {ctx.author.mention}.",
             discord.Color.orange()
         )
+        _log_action(ctx.guild.id, "nuke_spam", ctx.author.id, f"Eliminados: {len(borrados)}")
     except discord.Forbidden:
         e = make_embed("❌ Error", "No tengo permisos para eliminar mensajes en este canal.",
                        discord.Color.red())
@@ -720,6 +1038,7 @@ async def verify_role(ctx, role_id: int = None):
         )
         await ctx.send(embed=e)
         await log(ctx.guild, e)
+        _log_action(ctx.guild.id, "verify_role", ctx.author.id, "Desactivar")
         return
 
     role = ctx.guild.get_role(role_id)
@@ -739,6 +1058,7 @@ async def verify_role(ctx, role_id: int = None):
     )
     await ctx.send(embed=e)
     await log(ctx.guild, e)
+    _log_action(ctx.guild.id, "verify_role", ctx.author.id, f"Configurar: {role.name}")
 
 
 @bot.command(name="raid-alert")
@@ -755,6 +1075,7 @@ async def raid_alert(ctx, role: discord.Role = None):
         )
         await ctx.send(embed=e)
         await log(ctx.guild, e)
+        _log_action(ctx.guild.id, "raid_alert", ctx.author.id, "Desactivar")
         return
 
     cfg["raid_alert_role_id"] = role.id
@@ -765,6 +1086,7 @@ async def raid_alert(ctx, role: discord.Role = None):
     )
     await ctx.send(embed=e)
     await log(ctx.guild, e)
+    _log_action(ctx.guild.id, "raid_alert", ctx.author.id, f"Configurar: {role.name}")
 
 
 @bot.command(name="config")
@@ -795,6 +1117,7 @@ async def config_cmd(ctx):
     e.add_field(name="🔐 Rol verificación",   value=role_name(cfg["verify_role_id"]),         inline=True)
     e.add_field(name="🔔 Rol alerta raid",    value=role_name(cfg["raid_alert_role_id"]),     inline=True)
     e.add_field(name="📋 Whitelist",          value=f"{wl_count} usuario(s)",                 inline=True)
+    e.add_field(name="🚨 Filtro spam",        value="✅ Activo" if cfg["spam_filter"] else "❌ Inactivo", inline=True)
     e.add_field(name="⏱️ Umbral raid",        value=f"{JOIN_THRESHOLD} joins en {JOIN_WINDOW}s", inline=True)
     e.add_field(name="📅 Edad mínima cuenta", value=f"{ACCOUNT_MIN_AGE} días",                inline=True)
     e.add_field(name="🔇 Duración mute",      value=f"{MUTE_DURATION}s",                      inline=True)
@@ -821,6 +1144,7 @@ async def reset_stats(ctx):
     )
     await ctx.send(embed=e)
     await log(ctx.guild, e)
+    _log_action(guild_id, "reset_stats", ctx.author.id, "Reiniciar stats")
 
 
 # ─────────────────────────────────────────
