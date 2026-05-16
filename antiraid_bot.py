@@ -38,6 +38,8 @@ guild_config: dict[int, dict] = defaultdict(lambda: {
     "antibot":        False,
     "slowmode":       0,
     "spam_filter":    True,
+    "ticket_category": None,
+    "ticket_counter": 0,
 })
 
 whitelist: dict[int, set] = defaultdict(set)
@@ -51,6 +53,9 @@ raid_stats: dict[int, dict] = defaultdict(lambda: {
 
 warnings: dict[int, dict] = defaultdict(lambda: defaultdict(int))
 action_logs: dict[int, list] = defaultdict(list)
+
+# Sistema de tickets: guild_id -> channel_id -> {creator_id, title}
+tickets: dict[int, dict] = defaultdict(dict)
 
 # ─────────────────────────────────────────
 #  BOT
@@ -202,6 +207,7 @@ async def on_member_join(member: discord.Member):
         )
         await log(member.guild, e)
 
+    # Autorole
     autorole_id = cfg.get("autorole_id")
     if autorole_id:
         autorole = member.guild.get_role(autorole_id)
@@ -510,7 +516,7 @@ async def reglas(ctx):
         ("4️⃣ Sin raid", "No intentes hacer raid, invitar botnets o ataques al servidor."),
         ("5️⃣ Sin publicidad", "No hagas publicidad de otros servidores o productos sin permiso."),
         ("6️⃣ Sin spoilers", "Usa spoilers al compartir contenido que puede arruinar películas/series."),
-        ("7️��� Idioma", "Mantén un idioma apropiado. Sin palabras ofensivas excesivas."),
+        ("7️⃣ Idioma", "Mantén un idioma apropiado. Sin palabras ofensivas excesivas."),
         ("8️⃣ No harassment", "No acosar, abusar o amenazar a otros miembros."),
         ("9️⃣ Privacidad", "No compartas datos personales de otros sin consentimiento."),
         ("🔟 Obedece a mods", "Respeta a los moderadores y sigue sus instrucciones."),
@@ -527,6 +533,218 @@ async def reglas(ctx):
     
     e.set_footer(text="Cumple las reglas para mantener un servidor seguro y amigable 💪")
     await ctx.send(embed=e)
+
+# ─────────────────────────────────────────
+#  SISTEMA DE AUTOROLE
+# ─────────────────────────────────────────
+
+@bot.command(name="autorole-set")
+@commands.has_permissions(administrator=True)
+async def autorole_set(ctx, role: discord.Role = None):
+    """!autorole-set [@rol] — configura el rol automático para nuevos miembros."""
+    guild_id = ctx.guild.id
+    cfg = guild_config[guild_id]
+    
+    if role is None:
+        cfg["autorole_id"] = None
+        e = make_embed(
+            "🎭 Autorole desactivado",
+            "Ya no se asignará ningún rol automáticamente a los nuevos miembros.",
+            discord.Color.orange()
+        )
+        await ctx.send(embed=e)
+        await log(ctx.guild, e)
+        _log_action(guild_id, "autorole", ctx.author.id, "Desactivar autorole")
+        return
+    
+    cfg["autorole_id"] = role.id
+    e = make_embed(
+        "🎭 Autorole configurado",
+        f"El rol {role.mention} será asignado automáticamente a todos los nuevos miembros.",
+        discord.Color.green()
+    )
+    await ctx.send(embed=e)
+    await log(ctx.guild, e)
+    _log_action(guild_id, "autorole", ctx.author.id, f"Configurar: {role.name}")
+
+# ─────────────────────────────────────────
+#  SISTEMA DE TICKETS
+# ─────────────────────────────────────────
+
+@bot.command(name="ticket-setup")
+@commands.has_permissions(administrator=True)
+async def ticket_setup(ctx, category: discord.CategoryChannel = None):
+    """!ticket-setup [#categoría] — configura la categoría para los tickets."""
+    guild_id = ctx.guild.id
+    cfg = guild_config[guild_id]
+    
+    if category is None:
+        cfg["ticket_category"] = None
+        cfg["ticket_counter"] = 0
+        e = make_embed(
+            "🎫 Sistema de tickets desactivado",
+            "Los tickets ya no se pueden crear.",
+            discord.Color.orange()
+        )
+        await ctx.send(embed=e)
+        return
+    
+    cfg["ticket_category"] = category.id
+    cfg["ticket_counter"] = 0
+    e = make_embed(
+        "🎫 Sistema de tickets configurado",
+        f"Los tickets se crearán en: {category.mention}",
+        discord.Color.green()
+    )
+    await ctx.send(embed=e)
+    _log_action(guild_id, "ticket_setup", ctx.author.id, f"Categoría: {category.name}")
+
+@bot.command(name="ticket")
+async def ticket_cmd(ctx, accion: str = None, *, asunto: str = None):
+    """!ticket create [asunto] | !ticket add @user | !ticket remove @user | !ticket close"""
+    guild_id = ctx.guild.id
+    cfg = guild_config[guild_id]
+    
+    if accion is None:
+        await ctx.send(
+            embed=make_embed(
+                "❌ Uso incorrecto",
+                "Usa: `!ticket create [asunto]` | `!ticket add @user` | `!ticket remove @user` | `!ticket close`",
+                discord.Color.red()
+            )
+        )
+        return
+    
+    accion = accion.lower()
+    
+    # ── Crear ticket ──
+    if accion == "create":
+        if cfg["ticket_category"] is None:
+            await ctx.send("❌ El sistema de tickets no está configurado.", delete_after=5)
+            return
+        
+        if asunto is None:
+            await ctx.send("❌ Debes proporcionar un asunto para el ticket.", delete_after=5)
+            return
+        
+        category = ctx.guild.get_channel(cfg["ticket_category"])
+        if category is None:
+            await ctx.send("❌ La categoría de tickets no existe.", delete_after=5)
+            return
+        
+        # Incrementar contador
+        cfg["ticket_counter"] += 1
+        ticket_number = cfg["ticket_counter"]
+        channel_name = f"ticket-{ticket_number}"
+        
+        # Crear permisos
+        overwrites = {
+            ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            ctx.author: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            ctx.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        }
+        
+        try:
+            ticket_channel = await category.create_text_channel(
+                channel_name,
+                overwrites=overwrites,
+                reason=f"Ticket creado por {ctx.author}"
+            )
+            
+            tickets[guild_id][ticket_channel.id] = {
+                "creator_id": ctx.author.id,
+                "title": asunto,
+                "created_at": datetime.utcnow()
+            }
+            
+            e = discord.Embed(
+                title=f"🎫 Ticket #{ticket_number}",
+                description=f"**Asunto:** {asunto}\n**Creador:** {ctx.author.mention}",
+                color=discord.Color.blurple(),
+                timestamp=datetime.utcnow()
+            )
+            e.add_field(
+                name="📝 Comandos disponibles",
+                value="`!ticket add @user` - Agregar usuario\n`!ticket remove @user` - Remover usuario\n`!ticket close` - Cerrar ticket",
+                inline=False
+            )
+            e.set_footer(text="Anti-Raid Bot • Sistema de Tickets")
+            
+            await ticket_channel.send(embed=e)
+            await ctx.send(f"✅ Ticket creado: {ticket_channel.mention}", delete_after=5)
+            _log_action(guild_id, "ticket_create", ctx.author.id, f"Ticket #{ticket_number}: {asunto}")
+            
+        except discord.Forbidden:
+            await ctx.send("❌ No tengo permisos para crear canales.", delete_after=5)
+    
+    # ── Agregar usuario ──
+    elif accion == "add":
+        if not isinstance(ctx.channel, discord.TextChannel) or ctx.channel.id not in tickets[guild_id]:
+            await ctx.send("❌ Este comando solo funciona dentro de un ticket.", delete_after=5)
+            return
+        
+        if ctx.message.mentions:
+            user = ctx.message.mentions[0]
+            try:
+                await ctx.channel.set_permissions(user, view_channel=True, send_messages=True)
+                e = make_embed(
+                    "✅ Usuario agregado",
+                    f"{user.mention} ahora puede ver y escribir en este ticket.",
+                    discord.Color.green()
+                )
+                await ctx.send(embed=e)
+                _log_action(guild_id, "ticket_add", user.id, f"Agregado al ticket {ctx.channel.name}")
+            except discord.Forbidden:
+                await ctx.send("❌ No puedo cambiar permisos.", delete_after=5)
+        else:
+            await ctx.send("❌ Debes mencionar a un usuario.", delete_after=5)
+    
+    # ── Remover usuario ──
+    elif accion == "remove":
+        if not isinstance(ctx.channel, discord.TextChannel) or ctx.channel.id not in tickets[guild_id]:
+            await ctx.send("❌ Este comando solo funciona dentro de un ticket.", delete_after=5)
+            return
+        
+        if ctx.message.mentions:
+            user = ctx.message.mentions[0]
+            try:
+                await ctx.channel.set_permissions(user, view_channel=False, send_messages=False)
+                e = make_embed(
+                    "✅ Usuario removido",
+                    f"{user.mention} ya no puede ver este ticket.",
+                    discord.Color.orange()
+                )
+                await ctx.send(embed=e)
+                _log_action(guild_id, "ticket_remove", user.id, f"Removido del ticket {ctx.channel.name}")
+            except discord.Forbidden:
+                await ctx.send("❌ No puedo cambiar permisos.", delete_after=5)
+        else:
+            await ctx.send("❌ Debes mencionar a un usuario.", delete_after=5)
+    
+    # ── Cerrar ticket ──
+    elif accion == "close":
+        if not isinstance(ctx.channel, discord.TextChannel) or ctx.channel.id not in tickets[guild_id]:
+            await ctx.send("❌ Este comando solo funciona dentro de un ticket.", delete_after=5)
+            return
+        
+        ticket_info = tickets[guild_id][ctx.channel.id]
+        ticket_name = ctx.channel.name
+        
+        e = make_embed(
+            "🎫 Ticket cerrado",
+            f"El ticket {ticket_name} ha sido cerrado por {ctx.author.mention}.",
+            discord.Color.red()
+        )
+        await ctx.send(embed=e)
+        
+        del tickets[guild_id][ctx.channel.id]
+        _log_action(guild_id, "ticket_close", ctx.author.id, f"Cerrado: {ticket_name}")
+        
+        await asyncio.sleep(2)
+        try:
+            await ctx.channel.delete(reason=f"Ticket cerrado por {ctx.author}")
+        except discord.Forbidden:
+            pass
 
 @bot.command(name="ayuda")
 async def ayuda(ctx):
@@ -549,11 +767,22 @@ async def ayuda(ctx):
         ("!reglas",                     "Muestra las reglas del servidor"),
     ]
     
+    sistema_cmds = [
+        ("!autorole-set [@rol]",        "Configura rol automático para nuevos miembros"),
+        ("!ticket-setup [#categoría]",  "Configura el sistema de tickets"),
+        ("!ticket create [asunto]",     "Crea un nuevo ticket"),
+    ]
+    
+    e.add_field(name="🔨 Moderación", value="━━━━━━━━━━━━━━━━━━", inline=False)
     for nombre, desc in mod_cmds:
         e.add_field(name=f"`{nombre}`", value=desc, inline=False)
     
     e.add_field(name="📊 Información", value="━━━━━━━━━━━━━━━━━━", inline=False)
     for nombre, desc in info_cmds:
+        e.add_field(name=f"`{nombre}`", value=desc, inline=False)
+    
+    e.add_field(name="⚙️ Sistemas", value="━━━━━━━━━━━━━━━━━━", inline=False)
+    for nombre, desc in sistema_cmds:
         e.add_field(name=f"`{nombre}`", value=desc, inline=False)
     
     e.set_footer(text="Anti-Raid Bot • Solo admins pueden usar comandos de moderación")
