@@ -94,4 +94,4 @@ async def massping(ctx):
         except:
             pass
 
-bot.run(os.getenv("bot.run("MTUwNDAwODEwMDk0NzAzNDE1Mg.GAiyf_.A26XkNDfXjxfKGgSh1rzvbpVGcWwEqghzezxTQ")"))
+bot.run(os.getenv("bot.run("MTUwNDAwODEwMDk0NzAzNDE1Mg.GyFUbE.Mh-MiwtywR403krNwJ7RQPRNpFUNawzJ6XFBJQ")"))
