@@ -5,7 +5,7 @@ import random
 import string
 import os
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("MTUwNDAwODEwMDk0NzAzNDE1Mg.GyhcVR.A5D2lz1PPgI0A60gWDkBhQJx_manR6A7o1OBx0")
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN environment variable is not set")
 
@@ -99,4 +99,4 @@ async def massping(ctx):
         except:
             pass
 
-bot.run(TOKEN)
+bot.run(MTUwNDAwODEwMDk0NzAzNDE1Mg.GyhcVR.A5D2lz1PPgI0A60gWDkBhQJx_manR6A7o1OBx0)
