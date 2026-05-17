@@ -1,1 +1,1 @@
-worker: python Raid_bot.py
+CMD ["python", "Raid_bot.py"]
