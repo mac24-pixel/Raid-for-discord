@@ -3,6 +3,11 @@ from discord.ext import commands
 import asyncio
 import random
 import string
+import os
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise ValueError("DISCORD_TOKEN environment variable is not set")
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
@@ -94,4 +99,4 @@ async def massping(ctx):
         except:
             pass
 
-bot.run("MTUwNDAwODEwMDk0NzAzNDE1Mg.GRHklE.Qe-hc8BOMC-7DlZUmEotEfIK7GMKIBAyrMidXg")
+bot.run(TOKEN)
