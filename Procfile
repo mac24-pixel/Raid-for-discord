@@ -1,1 +1,1 @@
-worker: python antiraid_bot.py
+worker: python Raid_bot.py
